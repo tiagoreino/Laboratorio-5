@@ -1,3 +1,6 @@
+
+#define F_CPU 16000000UL
+
 #include "lcd_con_i2c.h"
 
 // ============= || LCD PARA I2C || =================

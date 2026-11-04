@@ -1,5 +1,6 @@
 #define F_CPU 16000000UL
 
+// Librerias del sistema
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
@@ -7,10 +8,12 @@
 #include <util/atomic.h>
 #include <stdio.h>
 
+// Librerias propias
 #include "lcd_con_i2c.h"
 #include "adc_variable.h"
 #include "dh11_temp.h" // DH11 = PD5
 
+// =================== LUT ==================
 const char texto_activo[] PROGMEM = "Estado: Activo";
 const char texto_standby[] PROGMEM = "Estado: Standby";
 const char texto_esperando[] PROGMEM = "Esperando...";
@@ -28,6 +31,7 @@ const char* const tabla_estados[] PROGMEM = {
 // ========== INDICE DE ESTADOS ==================
 #define EST_ACTIVO      0
 #define EST_STANDBY     1
+#define EST_APAGADO     2
 #define EST_EMERGENCIA  3
 
 #define Pot 0      // ADC0 = PC0
@@ -39,6 +43,8 @@ const char* const tabla_estados[] PROGMEM = {
 
 // Puntero de estado actual
 static void (*estado)(void);
+
+static void cambiar_estado(void (*nuevo)(void));
 
 // ========== Estados ==============
 static void activo(void);
@@ -53,13 +59,15 @@ void configurar_interrupciones(void);
 uint16_t valor_adc = 0;
 int8_t valor_dh11 = 0;
 uint8_t i = 0;
-volatile uint8_t estadoin = EST_ACTIVO;
+static uint8_t entrando = 1;
 
 uint32_t obtener_tiempo(void);
 void actualizar_lcd(uint8_t indice_estado);
 void configurar_interrupciones(void);
 
 // ===== VARIABLES GLOBALES =====
+
+volatile uint8_t estadoin = EST_ACTIVO;
 
 volatile uint32_t contador_ms = 0;
 
@@ -112,13 +120,16 @@ int main(void){
 		if (evento_emergencia)
 		{
 			evento_emergencia = 0;
-			estado = emergencia;
+			cambiar_estado(emergencia);
 		}
 		else if (evento_boton)
 		{
-			evento_boton = 0;		
-			lcd_power_on();
-			estado = actividad;
+			evento_boton = 0;
+			if (estado == apagado)
+			{
+				lcd_power_on();      // solo si venía apagada
+			}
+			cambiar_estado(actividad);
 		}
 
 		estado();
@@ -128,75 +139,94 @@ int main(void){
 
 static void activo(void)
 {
-	PORTD &= ~(1 << Bu);
-	estadoin = EST_ACTIVO;
-	
+	if (entrando)
+	{
+		entrando = 0;
+		estadoin = EST_ACTIVO;
+		PORTD &= ~(1 << Bu);
+		actualizar_lcd(EST_ACTIVO);       // muestra "Activo" al instante
+	}
+
 	if (obtener_tiempo() >= 10000)
 	{
-		estado = standby;
+		cambiar_estado(standby);
 	}
-	
 }
 
 static void standby(void)
 {
-	PORTD &= ~((1 << Bu) | (1 << LED));
-	estadoin = EST_STANDBY;	
-	
+	if (entrando)
+	{
+		entrando = 0;
+		estadoin = EST_STANDBY;
+		lcd_pendiente = 0;                // descarta un refresco "Activo" pendiente
+		PORTD &= ~((1 << Bu) | (1 << LED));
+		actualizar_lcd(EST_STANDBY);      // "Estado: Standby" + "Esperando..." UNA vez
+	}
+
 	// Faltaria Dormir --> Parte B
-	
+
 	if (obtener_tiempo() >= 30000)
 	{
-		estado = apagado;
+		cambiar_estado(apagado);
 	}
-	
 }
 
 static void apagado(void)
 {
-	PORTD &= ~((1 << Bu) | (1 << LED));
-	
-	lcd_power_off();
-	
+	if (entrando)
+	{
+		entrando = 0;
+		estadoin = EST_APAGADO;
+		lcd_pendiente = 0;
+		PORTD &= ~((1 << Bu) | (1 << LED));
+		lcd_power_off();                  // UNA vez, no en cada vuelta
+	}
+
 	// Faltaria Dormir --> Parte B
-	
 }
 
 static void actividad(void)
 {
-	
-	estadoin = EST_ACTIVO;
+	if (entrando)
+	{
+		entrando = 0;
+		estadoin = EST_ACTIVO;
+	}
 
 	if (!(PIND & (1 << B1)))
 	{
-		PORTD |= (1 << Bu);   // Buzzer encendido
+		PORTD |= (1 << Bu);               // Buzzer encendido
 	}
 	else
 	{
-		PORTD &= ~(1 << Bu);  // Buzzer apagado
-		estado = activo;
+		PORTD &= ~(1 << Bu);              // Buzzer apagado
 		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
 		{
 			contador_ms = 0;
 		}
+		cambiar_estado(activo);
 	}
-	
 }
 
 static void emergencia(void)
 {
 	cli();
-	
+	lcd_power_on();                       // por si venía de APAGADO con el display off
 	actualizar_lcd(EST_EMERGENCIA);
-
 	PORTD &= ~((1 << Bu) | (1 << LED));
-
 	estadoin = EST_EMERGENCIA;
 
 	while (1)
 	{
 		// Permanece bloqueado hasta reiniciar el microcontrolador.
 	}
+}
+
+static void cambiar_estado(void (*nuevo)(void))
+{
+	estado = nuevo;
+	entrando = 1;
 }
 
 void configurar_interrupciones(void) {
@@ -255,7 +285,7 @@ void actualizar_lcd(uint8_t indice_estado)
 	if(indice_estado == 0){
 		
 		// Generar información dinámica
-		snprintf_P(linea2, sizeof(linea2), PSTR("ADC:%u Temp:%dC"), (unsigned int)valor_adc, (int)valor_dh11);
+		snprintf_P(linea2, sizeof(linea2), PSTR("ADC:%u Tem:%dC"), (unsigned int)valor_adc, (int)valor_dh11);
 		
 	}else{
 		
@@ -288,18 +318,20 @@ uint32_t obtener_tiempo(void)
 	return tiempo;
 }
 
-// ============ TIMER1 100ms comprueba ADC y parpadea LED cada 200ms ====================
+// ============ TIMER1 100ms comprueba acciones mediante flags ====================
 
 ISR(TIMER1_COMPA_vect)
 {
 	if (estadoin == EST_ACTIVO)
 	{
 		adc_pendiente = 1;
-
 		ticks_100ms++;
 
 		if ((ticks_100ms % 2) == 0)
 		led_pendiente = 1;
+
+		if ((ticks_100ms % 5) == 0)
+		lcd_pendiente = 1;
 
 		if (ticks_100ms >= 20)
 		{
@@ -307,10 +339,7 @@ ISR(TIMER1_COMPA_vect)
 			temperatura_pendiente = 1;
 		}
 	}
-	if ((ticks_100ms % 5) == 0)
-	lcd_pendiente = 1;
 }
-
 //=================== VECTORES DE INTERRUPCIONES POR BOTONES ===================
 
 ISR(INT0_vect)
