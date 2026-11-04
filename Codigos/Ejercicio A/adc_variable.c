@@ -67,7 +67,7 @@ uint16_t ADC_leer(uint8_t canal)
 	// Seleccionar referencia AVcc y canal ADC
 	ADMUX = (1 << REFS0) | (canal & 0x0F);
 
-	// Iniciar conversión
+	// Iniciar conversiÃ³n
 	ADCSRA |= (1 << ADSC);
 
 	// Esperar hasta que termine
