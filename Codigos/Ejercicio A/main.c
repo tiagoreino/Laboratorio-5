@@ -87,9 +87,18 @@ int main(void){
 	
 	ADC_init(128);
 	lcd_init();
-	configurar_interrupciones();
 	
-	estado = activo;
+	
+	if (!(PIND & (1 << B2)))
+	{
+		estado = emergencia;                 // arranca directo en estado seguro
+	}else{
+		
+		estado = activo;
+		
+	}
+	
+	configurar_interrupciones();
 	
 	while (1)
 	{
@@ -120,7 +129,10 @@ int main(void){
 		if (evento_emergencia)
 		{
 			evento_emergencia = 0;
-			cambiar_estado(emergencia);
+			if (!(PIND & (1 << B2)))          // solo si B2 sigue apretado
+			{
+				cambiar_estado(emergencia);
+			}
 		}
 		else if (evento_boton)
 		{
@@ -233,8 +245,9 @@ void configurar_interrupciones(void) {
 	// Botones INT0 e INT1
 	DDRD &= ~((1 << PD2) | (1 << PD3));
 	PORTD |= (1 << PD2) | (1 << PD3);
+	_delay_ms(50);
 	
-	// Timer0 = Modo CTC 
+	// Timer0 = Modo CTC
 	TCCR0A &= ~(1 << WGM00);
 	TCCR0A |= (1 << WGM01);
 	TCCR0B &= ~(1 << WGM02);
@@ -287,7 +300,7 @@ void actualizar_lcd(uint8_t indice_estado)
 		// Generar información dinámica
 		snprintf_P(linea2, sizeof(linea2), PSTR("ADC:%u Tem:%dC"), (unsigned int)valor_adc, (int)valor_dh11);
 		
-	}else{
+		}else{
 		
 		const char *texto_flash = (const char *)pgm_read_ptr(&tabla_estados[indice_estado + 1]);
 		
