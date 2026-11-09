@@ -64,7 +64,7 @@ int main(void) {
 				// Prueba: encender LED PB5 durante 500 ms si no está accionado PD2, para observar cambios en la corriente
 				if (!s1_pendiente) {
 					PORTB |= _BV(PB5);
-					_delay_ms(500);
+					_delay_ms(25);
 					PORTB &= ~_BV(PB5);
 				}
 			}
