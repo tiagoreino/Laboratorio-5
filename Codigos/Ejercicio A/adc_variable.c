@@ -11,7 +11,7 @@ void ADC_init(uint8_t preescaler)
 		ADCSRA = (1 << ADEN)  |
 		(0 << ADPS2) |
 		(0 << ADPS1) |
-		(0 << ADPS0);	
+		(0 << ADPS0);
 	}
 	else if (preescaler == 4)
 	{
@@ -64,6 +64,9 @@ void ADC_init(uint8_t preescaler)
 // LEER ADC
 uint16_t ADC_leer(uint8_t canal)
 {
+	// Si el ADC está apagado por PRR no se puede usar: ADSC nunca arranca
+	if (PRR & (1 << PRADC)) return 0;
+
 	// Seleccionar referencia AVcc y canal ADC
 	ADMUX = (1 << REFS0) | (canal & 0x0F);
 
@@ -74,4 +77,17 @@ uint16_t ADC_leer(uint8_t canal)
 	while (ADCSRA & (1 << ADSC));
 
 	return ADC;
+}
+
+// ========== Gestión de energía ==========
+void ADC_apagar(void)
+{
+	ADCSRA &= ~(1 << ADEN);     // 1) apagar el conversor (si no, sigue consumiendo)
+	PRR    |=  (1 << PRADC);    // 2) cortarle el reloj
+}
+
+void ADC_encender(void)
+{
+	PRR    &= ~(1 << PRADC);    // 1) devolverle el reloj (antes no se puede escribir ADCSRA)
+	ADCSRA |=  (1 << ADEN);     // 2) prenderlo; conserva el prescaler de ADC_init
 }

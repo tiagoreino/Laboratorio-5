@@ -1,4 +1,3 @@
-
 #define F_CPU 16000000UL
 
 #include "lcd_con_i2c.h"
@@ -11,25 +10,40 @@ void twi_init(void) {
 	TWBR = 72;       // SCL = F_CPU / (16 + 2*TWBR) = 16 MHz / 160 = 100 kHz
 }
 
+// ======= Espera TWINT con timeout =======
+// Sin timeout, si el TWI está apagado por PRR o el bus queda trabado,
+// el programa se cuelga para siempre en el while.
+static void twi_esperar(void) {
+	uint16_t n = 2000;                                   // ~1 ms a 16 MHz, sobra (un byte tarda 90 us)
+	while (!(TWCR & (1 << TWINT)) && --n);
+}
+
 // ============== Habilita protocolo TWI ============
 void twi_start(uint8_t direccion_escritura) {
+	if (PRR & (1 << PRTWI)) return;                      // TWI apagado por PRR: no hacer nada
 	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);   // condicion START
-	while (!(TWCR & (1 << TWINT)));
+	twi_esperar();
 	TWDR = direccion_escritura;                          // direccion + bit W
 	TWCR = (1 << TWINT) | (1 << TWEN);
-	while (!(TWCR & (1 << TWINT)));
+	twi_esperar();
 }
 
 // ========== Enviar dato por TWI ==============
 void twi_write(uint8_t dato) {
+	if (PRR & (1 << PRTWI)) return;
 	TWDR = dato;
 	TWCR = (1 << TWINT) | (1 << TWEN);
-	while (!(TWCR & (1 << TWINT)));
+	twi_esperar();
 }
 
 // =========== Detener Envio de Datos TWI ===========
 void twi_stop(void) {
+	if (PRR & (1 << PRTWI)) return;
 	TWCR = (1 << TWINT) | (1 << TWEN) | (1 << TWSTO);   // condicion STOP
+	// Esperar a que el STOP salga de verdad. Si justo después se apaga el TWI
+	// con PRR, el STOP queda a medias y el expansor PCF8574 queda colgado.
+	uint16_t n = 2000;
+	while ((TWCR & (1 << TWSTO)) && --n);
 }
 
 // ========== Definición de nibble (CORREGIDO) =============

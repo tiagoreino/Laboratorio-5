@@ -1,73 +1,84 @@
 #include "dh11_temp.h"
+#include <util/atomic.h>
 
-#define DHT_PIN PD5
+#define DHT_PIN      PD5
+#define DHT_LEER()   (PIND & (1 << DHT_PIN))
+#define TIMEOUT_US   100   /* ningún pulso del DHT11 dura más de ~90 us */
 
-void DHT_start(){
-	DDRD |= (1<<DHT_PIN); // Configurar como salida
-	PORTD &= ~(1<<DHT_PIN); // Enviar señal de inicio (bajo)
-	_delay_ms(18); // Esperar al menos 18 ms
-	PORTD |= (1<<DHT_PIN); // Liberar la línea
-	_delay_us(40); // Esperar 40 µs
-}
-
-uint8_t DHT_response() {
-	DDRD &= ~(1<<DHT_PIN); // Configurar como entrada
-	_delay_us(40);
-	if (!(PIND & (1<<DHT_PIN))) { // Esperar respuesta baja del sensor
-		_delay_us(80);
-		if ((PIND & (1<<DHT_PIN))) { // Esperar respuesta alta del sensor
-			_delay_us(80);
-			return 1; // Respuesta válida
-		}
+/* Espera a que el pin llegue a 'nivel' (0 o distinto de 0).
+   Devuelve 1 si llegó, 0 si se pasó el timeout -> no se cuelga nunca. */
+static uint8_t esperar_nivel(uint8_t nivel)
+{
+	for (uint8_t i = 0; i < TIMEOUT_US; i++) {
+		if ((DHT_LEER() != 0) == (nivel != 0)) return 1;
+		_delay_us(1);
 	}
-	return 0; // Sin respuesta
+	return 0;
 }
 
-uint8_t DHT_read(void) {
-	uint8_t resultado = 0;
+void DHT_start(void)
+{
+	DDRD  |=  (1 << DHT_PIN);   /* salida */
+	PORTD &= ~(1 << DHT_PIN);   /* bajo >= 18 ms */
+	_delay_ms(20);
+	PORTD |=  (1 << DHT_PIN);   /* soltar la línea */
+	DDRD  &= ~(1 << DHT_PIN);   /* entrada con pull-up (PORTD sigue en 1) */
+}
+
+uint8_t DHT_response(void)
+{
+	/* el sensor tira la línea a bajo ~80 us, después alto ~80 us,
+	   y después baja para empezar el primer bit */
+	if (!esperar_nivel(0)) return 0;
+	if (!esperar_nivel(1)) return 0;
+	if (!esperar_nivel(0)) return 0;
+	return 1;
+}
+
+/* Devuelve 0..255 en *byte; retorna 0 si hubo timeout */
+static uint8_t DHT_read_byte(uint8_t *byte)
+{
+	uint8_t r = 0;
 	for (uint8_t j = 0; j < 8; j++) {
-		// Esperar a que el pin de datos se ponga en ALTO (fin del pulso bajo de sincronización de 50us)
-		while (!(PIND & (1 << DHT_PIN)));
-		
-		// El pin está en ALTO. Esperamos 40 microsegundos para muestrear
-		_delay_us(40);
-		
-		if (!(PIND & (1 << DHT_PIN))) {
-			// Si el pin ya bajó antes de los 40us, el pulso alto duró poco (~26-28us) -> Es un '0'
-			resultado <<= 1;
-			} else {
-			// Si el pin sigue en ALTO después de 40us, el pulso es largo (~70us) -> Es un '1'
-			resultado = (resultado << 1) | 0x01;
-			
-			// Esperar a que el pin vuelva a BAJO para no engancharse en el siguiente bit
-			while (PIND & (1 << DHT_PIN));
+		if (!esperar_nivel(1)) return 0;   /* fin del bajo de 50 us */
+		_delay_us(40);                      /* '0' dura ~27 us, '1' ~70 us */
+		r <<= 1;
+		if (DHT_LEER()) {
+			r |= 1;
+			if (!esperar_nivel(0)) return 0;
 		}
 	}
-	return resultado;
+	*byte = r;
+	return 1;
 }
 
-uint8_t obtener_temperatura_dht(void) {
-	uint8_t dht_data[5]; // Array para almacenar los 5 bytes del sensor
+uint8_t DHT_leer(uint8_t *temperatura, uint8_t *humedad)
+{
+	uint8_t d[5];
+	uint8_t ok = 1;
 
-	// Iniciar comunicación y verificar si el sensor responde
-	DHT_start();
-	if (DHT_response()) {
-		
-		// Leer secuencialmente los 5 bytes que envía el DHT
-		dht_data[0] = DHT_read(); // Humedad entera
-		dht_data[1] = DHT_read(); // Humedad decimal
-		dht_data[2] = DHT_read(); // Temperatura entera 
-		dht_data[3] = DHT_read(); // Temperatura decimal
-		dht_data[4] = DHT_read(); // Checksum para verificar errores
+	DHT_start();                 /* los 20 ms con interrupciones prendidas */
 
-		// Verificar el Checksum
-		// Asegura que el cable no haya tenido ruido y la lectura sea real
-		uint8_t suma = dht_data[0] + dht_data[1] + dht_data[2] + dht_data[3];
-		if (suma == dht_data[4]) {
-			return dht_data[2]; // Retorna con éxito el byte de temperatura entera
+	/* los ~4 ms de bits son críticos en tiempo: sin interrupciones */
+	ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+		if (!DHT_response()) ok = 0;
+		for (uint8_t i = 0; ok && i < 5; i++) {
+			if (!DHT_read_byte(&d[i])) ok = 0;
 		}
 	}
-	
-	// Si el sensor no respondió o el checksum falló, retorna un código de error arbitrario
-	return 99;
+	if (!ok) return DHT_ERR_TIMEOUT;
+
+	if ((uint8_t)(d[0] + d[1] + d[2] + d[3]) != d[4]) return DHT_ERR_CHECKSUM;
+
+	*humedad     = d[0];
+	*temperatura = d[2];
+	return DHT_OK;
+}
+
+/* Compatibilidad con lo que ya usabas: 99 = error */
+uint8_t obtener_temperatura_dht(void)
+{
+	uint8_t t, h;
+	if (DHT_leer(&t, &h) != DHT_OK) return 99;
+	return t;
 }
