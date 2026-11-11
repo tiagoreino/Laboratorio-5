@@ -14,6 +14,7 @@
 #include "lcd_con_i2c.h"
 #include "adc_variable.h"
 #include "dh11_temp.h" // DH11 = PD5
+#include "bluetooth.h"
 
 // =================== LUT ==================
 const char texto_activo[] PROGMEM = "Estado: Activo";
@@ -66,6 +67,9 @@ static void apagado(void);
 static void actividad(void);
 static void emergencia(void);
 
+// Estados que se pueden pedir por BT (numeracion del diagrama)
+static void (* const tabla_bt[5])(void) = { activo, standby, apagado, actividad, emergencia };
+
 //=============== Configurar interrupciones ==================
 void configurar_interrupciones(void);
 
@@ -78,6 +82,7 @@ uint32_t obtener_tiempo(void);
 void actualizar_lcd(uint8_t indice_estado);
 void configurar_interrupciones(void);
 void entrar(uint8_t est);
+void ejecutar(uint8_t reg_cmd);
 
 // ===== VARIABLES GLOBALES =====
 
@@ -98,6 +103,12 @@ volatile uint8_t por_nivel = 0;
 
 static uint8_t ticks_100ms = 0;
 
+// Banderas que maneja la app
+uint8_t led_on = 1, adc_on = 1, dht_on = 1, lcd_on = 1, eventos_on = 1;
+
+// Registro de alarmas
+uint8_t reg_tipo[8], reg_dato[8], reg_pos = 0, reg_cant = 0;
+
 // Energia y WDT
 uint8_t prr_permitido = 0;
 uint8_t modo_reset = 0;        // SW8: 0 = prueba A (despertador), 1 = prueba B (reset)
@@ -112,6 +123,28 @@ void leer_mcusr(void)
 	mcusr_copia = MCUSR;
 	MCUSR = 0;
 	wdt_disable();
+}
+
+static void marcar_actividad(void)
+{
+	ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+	{
+		contador_ms = 0;
+	}
+}
+
+static void notificar(uint8_t ev, uint8_t dato)
+{
+	if (eventos_on) bt_enviar(RSP_EVENTO | ev, dato);
+}
+
+static void registrar(uint8_t ev, uint8_t dato)
+{
+	reg_tipo[reg_pos] = ev;
+	reg_dato[reg_pos] = dato;
+	reg_pos = (reg_pos + 1) & 7;
+	if (reg_cant < 8) reg_cant++;
+	notificar(ev, dato);
 }
 
 static uint8_t leer_dip(void)
@@ -144,7 +177,7 @@ static void aplicar_prr(uint8_t est)
 	uint8_t m = prr_estado[est] & prr_permitido;
 
 	if (m & (1 << PRADC)) ADC_apagar();      else ADC_encender();
-	if (m & (1 << PRUSART0)) PRR |= (1 << PRUSART0); else PRR &= ~(1 << PRUSART0);
+	if (m & (1 << PRUSART0)) bt_apagar();    else bt_prender();
 
 	if (m & (1 << PRTWI)) {
 		TWCR = 0;
@@ -186,7 +219,7 @@ static uint16_t leer_pot(void)
 static uint8_t hay_trabajo(void)
 {
 	return adc_pendiente || led_pendiente || lcd_pendiente || temperatura_pendiente
-	    || evento_boton || evento_emergencia || evento_wdt;
+	    || evento_boton || evento_emergencia || evento_wdt || uart_hay();
 }
 
 static void botones_flanco(void)
@@ -239,12 +272,14 @@ int main(void){
 	
 	ADC_init(128);
 	lcd_init();
+	uart_init();
 
 	configurar_interrupciones();
 
 	if (modo_reset) wdt_enable(WDTO_2S);
 
 	reset_wdt = (mcusr_copia & (1 << WDRF)) != 0;
+	registrar(EV_RESET, mcusr_copia);
 
 	if (reset_wdt || !(PIND & (1 << B2)))
 	{
@@ -259,28 +294,39 @@ int main(void){
 	{
 		if (modo_reset) wdt_reset();
 
+		uint8_t cmd;
+		while (parser_tarea(&cmd, (uint16_t)obtener_tiempo()))
+		{
+			ejecutar(cmd);
+		}
+
 		if (adc_pendiente)
 		{
 			adc_pendiente = 0;
-			valor_adc = ADC_leer(Pot);
+			if (adc_on) valor_adc = ADC_leer(Pot);
 		}
 
 		if (led_pendiente)
 		{
 			led_pendiente = 0;
-			PORTD ^= (1 << LED);
+			if (led_on) PORTD ^= (1 << LED);
+			else PORTD &= ~(1 << LED);
 		}
 
 		if (temperatura_pendiente)
 		{
 			temperatura_pendiente = 0;
-			valor_dh11 = obtener_temperatura_dht();
+			if (dht_on)
+			{
+				valor_dh11 = obtener_temperatura_dht();
+				if (valor_dh11 == 99) notificar(EV_ERROR_DHT, 0);
+			}
 		}
 
 		if (lcd_pendiente)
 		{
 			lcd_pendiente = 0;
-			actualizar_lcd(estadoin);
+			if (lcd_on) actualizar_lcd(estadoin);
 		}
 		
 		if (evento_emergencia)
@@ -288,6 +334,7 @@ int main(void){
 			evento_emergencia = 0;
 			if (!(PIND & (1 << B2)) && estado != emergencia)          // solo si B2 sigue apretado
 			{
+				registrar(EV_EMERGENCIA, 0);
 				cambiar_estado(emergencia);
 			}
 		}
@@ -296,6 +343,7 @@ int main(void){
 			evento_boton = 0;
 			if (estado != emergencia)
 			{
+				notificar(EV_BOTON, 0);
 				cambiar_estado(actividad);
 			}
 		}
@@ -313,6 +361,7 @@ void entrar(uint8_t est)
 	aplicar_prr(est);
 	if (est == EST_STANDBY) timer0_10ms();
 	else timer0_1ms();
+	if (est != EST_APAGADO) notificar(EV_CAMBIO_ESTADO, est);
 }
 
 static void activo(void)
@@ -353,6 +402,7 @@ static void apagado(void)
 {
 	if (entrando)
 	{
+		notificar(EV_CAMBIO_ESTADO, EST_APAGADO);   // antes de cortar el BT
 		lcd_power_off();                  // UNA vez, no en cada vuelta
 		entrar(EST_APAGADO);
 		lcd_pendiente = 0;
@@ -421,6 +471,7 @@ static void emergencia(void)
 	{
 		entrar(EST_EMERGENCIA);
 		PORTD &= ~((1 << Bu) | (1 << LED));
+		if (!lcd_on) { lcd_on = 1; lcd_power_on(); }
 		actualizar_lcd(EST_EMERGENCIA);
 		if (reset_wdt)
 		{
@@ -433,11 +484,9 @@ static void emergencia(void)
 	if ((PIND & (1 << B2)) && !(PIND & (1 << B1)))
 	{
 		reset_wdt = 0;
+		registrar(EV_FIN_EMERG, 0);
 		evento_boton = 0;
-		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
-		{
-			contador_ms = 0;
-		}
+		marcar_actividad();
 		cambiar_estado(activo);
 	}
 }
@@ -446,16 +495,95 @@ static void cambiar_estado(void (*nuevo)(void))
 {
 	if (estado == apagado && nuevo != apagado)
 	{
-		// Salir de APAGADO: devolver el TWI antes de prender la LCD
+		// Salir de APAGADO: devolver TWI y USART antes de usarlos
 		if (!modo_reset) wdt_disable();
 		evento_wdt = 0;
 		PRR &= ~((1 << PRTWI) | (1 << PRTIM0) | (1 << PRTIM1));
 		twi_init();
-		lcd_power_on();
+		bt_prender();
+		if (lcd_on) lcd_power_on();
+		notificar(EV_WDT, despertares_wdt);
 	}
 	estado = nuevo;
 	entrando = 1;
 }
+
+void ejecutar(uint8_t reg_cmd){
+	uint8_t cmd_alta = reg_cmd >> 4;
+	uint8_t cmd_baja = reg_cmd & 0x0F;
+	uint8_t seguro = (estado == emergencia);
+
+	if (!(cmd_alta == 4 && cmd_baja == 0)) marcar_actividad();   // el ping no cuenta como actividad
+
+	switch (cmd_alta){
+
+		case (0):   // parpadeo LED
+		case (1):   // ADC
+		case (2):   // DHT
+		case (3):   // LCD
+		case (6):   // eventos
+			if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+			if (seguro && (cmd_alta == 0 || cmd_alta == 3)) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
+			if (cmd_alta == 0) led_on = cmd_baja;
+			if (cmd_alta == 1) adc_on = cmd_baja;
+			if (cmd_alta == 2) dht_on = cmd_baja;
+			if (cmd_alta == 3)
+			{
+				lcd_on = cmd_baja;
+				if (lcd_on) { lcd_power_on(); actualizar_lcd(estadoin); }
+				else lcd_power_off();
+			}
+			if (cmd_alta == 6) eventos_on = cmd_baja;
+			bt_enviar(RSP_ACK | cmd_alta, estadoin);
+			if (cmd_alta == 6 && cmd_baja == 1)
+			{
+				for (uint8_t k = 0; k < reg_cant; k++)
+				{
+					uint8_t j = (reg_pos + 7 - k) & 7;
+					bt_enviar(RSP_REGISTRO | reg_tipo[j], reg_dato[j]);
+				}
+			}
+			break;
+
+		case (4):   // 1 = pedir datos, 0 = ping
+			if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+			bt_enviar(RSP_DATO | DATO_ESTADO, estadoin);
+			if (cmd_baja == 1)
+			{
+				bt_enviar(RSP_DATO | DATO_ADC, leer_pot() >> 2);
+				bt_enviar(RSP_DATO | DATO_TEMP, valor_dh11);
+				bt_enviar(RSP_DATO | DATO_PRR, PRR);
+				bt_enviar(RSP_DATO | DATO_WDT, despertares_wdt);
+			}
+			break;
+
+		case (5):   // cambiar de estado (0..4 como en el diagrama)
+			if (cmd_baja > 4) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+			if (seguro) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
+			bt_enviar(RSP_ACK | cmd_alta, cmd_baja);
+			if (cmd_baja == 4) registrar(EV_EMERGENCIA, 1);
+			cambiar_estado(tabla_bt[cmd_baja]);
+			break;
+
+		case (7):   // emergencia
+			if (cmd_baja == 1)
+			{
+				bt_enviar(RSP_ACK | cmd_alta, estadoin);
+				if (!seguro) { registrar(EV_EMERGENCIA, 1); cambiar_estado(emergencia); }
+			}
+			else
+			{
+				bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd);   // solo se sale con los botones
+			}
+			break;
+
+		default:
+			errores_chk++;
+			bt_enviar(RSP_NACK | ERR_COMANDO, reg_cmd);
+			break;
+	}
+}
+
 
 void configurar_interrupciones(void) {
 	// Botones INT0 e INT1
