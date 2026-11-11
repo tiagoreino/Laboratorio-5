@@ -4,6 +4,8 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
 #include <string.h>
 #include <util/atomic.h>
 #include <stdio.h>
@@ -82,6 +84,7 @@ void entrar(uint8_t est);
 volatile uint8_t estadoin = EST_ACTIVO;
 
 volatile uint32_t contador_ms = 0;
+volatile uint8_t paso_ms = 1;
 
 volatile uint8_t adc_pendiente = 0;
 volatile uint8_t led_pendiente = 0;
@@ -90,11 +93,26 @@ volatile uint8_t temperatura_pendiente = 0;
 
 volatile uint8_t evento_boton = 0;
 volatile uint8_t evento_emergencia = 0;
+volatile uint8_t evento_wdt = 0;
+volatile uint8_t por_nivel = 0;
 
 static uint8_t ticks_100ms = 0;
 
-// Energia
+// Energia y WDT
 uint8_t prr_permitido = 0;
+uint8_t modo_reset = 0;        // SW8: 0 = prueba A (despertador), 1 = prueba B (reset)
+uint8_t reset_wdt = 0;
+uint8_t despertares_wdt = 0;
+
+// Causa del reset: se lee antes del main para que el WDT no vuelva a resetear
+uint8_t mcusr_copia __attribute__((section(".noinit")));
+void leer_mcusr(void) __attribute__((naked, used, section(".init3")));
+void leer_mcusr(void)
+{
+	mcusr_copia = MCUSR;
+	MCUSR = 0;
+	wdt_disable();
+}
 
 static uint8_t leer_dip(void)
 {
@@ -140,17 +158,95 @@ static void aplicar_prr(uint8_t est)
 	PRR = (PRR & ~timers) | (m & timers);
 }
 
+static void timer0_1ms(void)
+{
+	TCCR0B = 0;
+	OCR0A = 249;                    // 16M / (64 * 250) = 1 ms
+	paso_ms = 1;
+	TCCR0B = (1 << CS01) | (1 << CS00);
+}
+
+static void timer0_10ms(void)
+{
+	TCCR0B = 0;
+	OCR0A = 155;                    // 16M / (1024 * 156) = 9,98 ms
+	paso_ms = 10;
+	TCCR0B = (1 << CS02) | (1 << CS00);
+}
+
+static uint16_t leer_pot(void)
+{
+	uint8_t apagado_prr = PRR & (1 << PRADC);
+	if (apagado_prr) ADC_encender();
+	uint16_t v = ADC_leer(Pot);
+	if (apagado_prr) ADC_apagar();
+	return v;
+}
+
+static uint8_t hay_trabajo(void)
+{
+	return adc_pendiente || led_pendiente || lcd_pendiente || temperatura_pendiente
+	    || evento_boton || evento_emergencia || evento_wdt;
+}
+
+static void botones_flanco(void)
+{
+	EIMSK = 0;
+	EICRA = (1 << ISC01) | (1 << ISC11);
+	EIFR = (1 << INTF0) | (1 << INTF1);
+	por_nivel = 0;
+	EIMSK = (1 << INT0) | (1 << INT1);
+}
+
+static void botones_nivel(void)      // en Power-Down INT0/INT1 solo despiertan por nivel
+{
+	EIMSK = 0;
+	EICRA = 0;
+	EIFR = (1 << INTF0) | (1 << INTF1);
+	por_nivel = 1;
+	EIMSK = (1 << INT0) | (1 << INT1);
+}
+
+static void dormir(uint8_t modo)
+{
+	set_sleep_mode(modo);
+	cli();
+	if (!hay_trabajo())
+	{
+		sleep_enable();
+		sei();
+		sleep_cpu();
+		sleep_disable();
+	}
+	sei();
+}
+
+static void simular_bloqueo(void)
+{
+	lcd_titulo("SIMULANDO", "BLOQUEO...");
+	while (1)
+	{
+		// No se llama a wdt_reset() -> el WDT resetea a los 2 s
+	}
+}
+
 int main(void){
 	
 	DDRD |= (1 << LED) | (1 << Bu);
 	DIDR0 = (1 << ADC0D);
+
+	modo_reset = leer_dip() >> 7;
 	
 	ADC_init(128);
 	lcd_init();
 
 	configurar_interrupciones();
 
-	if (!(PIND & (1 << B2)))
+	if (modo_reset) wdt_enable(WDTO_2S);
+
+	reset_wdt = (mcusr_copia & (1 << WDRF)) != 0;
+
+	if (reset_wdt || !(PIND & (1 << B2)))
 	{
 		estado = emergencia;                 // arranca directo en estado seguro
 	}else{
@@ -161,6 +257,8 @@ int main(void){
 
 	while (1)
 	{
+		if (modo_reset) wdt_reset();
+
 		if (adc_pendiente)
 		{
 			adc_pendiente = 0;
@@ -213,6 +311,8 @@ void entrar(uint8_t est)
 	entrando = 0;
 	estadoin = est;
 	aplicar_prr(est);
+	if (est == EST_STANDBY) timer0_10ms();
+	else timer0_1ms();
 }
 
 static void activo(void)
@@ -240,12 +340,13 @@ static void standby(void)
 		actualizar_lcd(EST_STANDBY);      // "Estado: Standby" + "Esperando..." UNA vez
 	}
 
-	// Faltaria Dormir --> Parte B
-
 	if (obtener_tiempo() >= 30000)
 	{
 		cambiar_estado(apagado);
+		return;
 	}
+
+	dormir(SLEEP_MODE_IDLE);              // despierta con Timer0, USART, INT0 o INT1
 }
 
 static void apagado(void)
@@ -256,21 +357,52 @@ static void apagado(void)
 		entrar(EST_APAGADO);
 		lcd_pendiente = 0;
 		PORTD &= ~((1 << Bu) | (1 << LED));
+		despertares_wdt = 0;
+		if (!modo_reset)                  // Prueba A: interrupcion cada 8 s
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				wdt_reset();
+				WDTCSR = (1 << WDCE) | (1 << WDE);
+				WDTCSR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
+			}
+		}
 	}
 
-	// Faltaria Dormir --> Parte B
+	if (evento_wdt)
+	{
+		evento_wdt = 0;
+		despertares_wdt++;
+		PORTD |= (1 << LED);              // pulso para medir el periodo
+		valor_adc = leer_pot();
+		_delay_ms(5);
+		PORTD &= ~(1 << LED);
+	}
+
+	botones_nivel();
+	if (modo_reset) wdt_disable();        // si no, el WDT resetea durante el sueño
+	dormir(SLEEP_MODE_PWR_DOWN);
+	if (modo_reset) wdt_enable(WDTO_2S);
+	botones_flanco();
 }
 
 static void actividad(void)
 {
+	static uint32_t t_presionado = 0;
+
 	if (entrando)
 	{
 		entrar(EST_ACTIVO);
+		t_presionado = obtener_tiempo();
 	}
 
 	if (!(PIND & (1 << B1)))
 	{
 		PORTD |= (1 << Bu);               // Buzzer encendido
+		if (modo_reset && obtener_tiempo() - t_presionado >= 5000)
+		{
+			simular_bloqueo();            // Prueba B: B1 mantenido 5 s
+		}
 	}
 	else
 	{
@@ -290,11 +422,17 @@ static void emergencia(void)
 		entrar(EST_EMERGENCIA);
 		PORTD &= ~((1 << Bu) | (1 << LED));
 		actualizar_lcd(EST_EMERGENCIA);
+		if (reset_wdt)
+		{
+			lcd_set_cursor(0, 1);
+			lcd_print("Reset por WDT  ");
+		}
 	}
 
 	// Recuperacion solo local: B2 suelto y B1 apretado
 	if ((PIND & (1 << B2)) && !(PIND & (1 << B1)))
 	{
+		reset_wdt = 0;
 		evento_boton = 0;
 		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
 		{
@@ -309,6 +447,8 @@ static void cambiar_estado(void (*nuevo)(void))
 	if (estado == apagado && nuevo != apagado)
 	{
 		// Salir de APAGADO: devolver el TWI antes de prender la LCD
+		if (!modo_reset) wdt_disable();
+		evento_wdt = 0;
 		PRR &= ~((1 << PRTWI) | (1 << PRTIM0) | (1 << PRTIM1));
 		twi_init();
 		lcd_power_on();
@@ -392,7 +532,7 @@ void actualizar_lcd(uint8_t indice_estado)
 
 ISR(TIMER0_COMPA_vect)
 {
-	contador_ms++;
+	contador_ms += paso_ms;
 }
 
 uint32_t obtener_tiempo(void)
@@ -433,11 +573,17 @@ ISR(TIMER1_COMPA_vect)
 
 ISR(INT0_vect)
 {
+	if (por_nivel) EIMSK &= ~(1 << INT0);   // por nivel se repetiria mientras este apretado
 	evento_boton = 1;
 }
 
 ISR(INT1_vect)
 {
+	if (por_nivel) EIMSK &= ~(1 << INT1);
 	evento_emergencia = 1;
 }
 
+ISR(WDT_vect)
+{
+	evento_wdt = 1;
+}
