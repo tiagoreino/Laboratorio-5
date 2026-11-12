@@ -117,14 +117,16 @@ uint8_t despertares_wdt = 0;
 
 // Causa del reset: se lee antes del main para que el WDT no vuelva a resetear
 uint8_t mcusr_copia __attribute__((section(".noinit")));
+uint16_t marca_bloqueo __attribute__((section(".noinit")));
 void leer_mcusr(void) __attribute__((naked, used, section(".init3")));
 void leer_mcusr(void)
 {
-	mcusr_copia = MCUSR;
+	uint8_t r2_boot;
+	__asm__ __volatile__ ("mov %0, r2" : "=r" (r2_boot));   // Optiboot deja aca el MCUSR original
+	mcusr_copia = MCUSR ? MCUSR : r2_boot;                  // sin bootloader MCUSR viene con datos
 	MCUSR = 0;
 	wdt_disable();
 }
-
 static void marcar_actividad(void)
 {
 	ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
@@ -182,7 +184,7 @@ static void aplicar_prr(uint8_t est)
 	if (m & (1 << PRTWI)) {
 		TWCR = 0;
 		PRR |= (1 << PRTWI);
-	} else if (PRR & (1 << PRTWI)) {
+		} else if (PRR & (1 << PRTWI)) {
 		PRR &= ~(1 << PRTWI);
 		twi_init();
 	}
@@ -219,7 +221,7 @@ static uint16_t leer_pot(void)
 static uint8_t hay_trabajo(void)
 {
 	return adc_pendiente || led_pendiente || lcd_pendiente || temperatura_pendiente
-	    || evento_boton || evento_emergencia || evento_wdt || uart_hay();
+	|| evento_boton || evento_emergencia || evento_wdt || uart_hay();
 }
 
 static void botones_flanco(void)
@@ -257,6 +259,7 @@ static void dormir(uint8_t modo)
 static void simular_bloqueo(void)
 {
 	lcd_titulo("SIMULANDO", "BLOQUEO...");
+	marca_bloqueo = 0xB10C;	
 	while (1)
 	{
 		// No se llama a wdt_reset() -> el WDT resetea a los 2 s
@@ -278,13 +281,14 @@ int main(void){
 
 	if (modo_reset) wdt_enable(WDTO_2S);
 
-	reset_wdt = (mcusr_copia & (1 << WDRF)) != 0;
+	reset_wdt = ((mcusr_copia & (1 << WDRF)) != 0) || (marca_bloqueo == 0xB10C);
+	marca_bloqueo = 0;
 	registrar(EV_RESET, mcusr_copia);
 
 	if (reset_wdt || !(PIND & (1 << B2)))
 	{
 		estado = emergencia;                 // arranca directo en estado seguro
-	}else{
+		}else{
 		
 		estado = activo;
 		
@@ -522,65 +526,65 @@ void ejecutar(uint8_t reg_cmd){
 		case (2):   // DHT
 		case (3):   // LCD
 		case (6):   // eventos
-			if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
-			if (seguro && (cmd_alta == 0 || cmd_alta == 3)) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
-			if (cmd_alta == 0) led_on = cmd_baja;
-			if (cmd_alta == 1) adc_on = cmd_baja;
-			if (cmd_alta == 2) dht_on = cmd_baja;
-			if (cmd_alta == 3)
+		if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+		if (seguro && (cmd_alta == 0 || cmd_alta == 3)) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
+		if (cmd_alta == 0) led_on = cmd_baja;
+		if (cmd_alta == 1) adc_on = cmd_baja;
+		if (cmd_alta == 2) dht_on = cmd_baja;
+		if (cmd_alta == 3)
+		{
+			lcd_on = cmd_baja;
+			if (lcd_on) { lcd_power_on(); actualizar_lcd(estadoin); }
+			else lcd_power_off();
+		}
+		if (cmd_alta == 6) eventos_on = cmd_baja;
+		bt_enviar(RSP_ACK | cmd_alta, estadoin);
+		if (cmd_alta == 6 && cmd_baja == 1)
+		{
+			for (uint8_t k = 0; k < reg_cant; k++)
 			{
-				lcd_on = cmd_baja;
-				if (lcd_on) { lcd_power_on(); actualizar_lcd(estadoin); }
-				else lcd_power_off();
+				uint8_t j = (reg_pos + 7 - k) & 7;
+				bt_enviar(RSP_REGISTRO | reg_tipo[j], reg_dato[j]);
 			}
-			if (cmd_alta == 6) eventos_on = cmd_baja;
-			bt_enviar(RSP_ACK | cmd_alta, estadoin);
-			if (cmd_alta == 6 && cmd_baja == 1)
-			{
-				for (uint8_t k = 0; k < reg_cant; k++)
-				{
-					uint8_t j = (reg_pos + 7 - k) & 7;
-					bt_enviar(RSP_REGISTRO | reg_tipo[j], reg_dato[j]);
-				}
-			}
-			break;
+		}
+		break;
 
 		case (4):   // 1 = pedir datos, 0 = ping
-			if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
-			bt_enviar(RSP_DATO | DATO_ESTADO, estadoin);
-			if (cmd_baja == 1)
-			{
-				bt_enviar(RSP_DATO | DATO_ADC, leer_pot() >> 2);
-				bt_enviar(RSP_DATO | DATO_TEMP, valor_dh11);
-				bt_enviar(RSP_DATO | DATO_PRR, PRR);
-				bt_enviar(RSP_DATO | DATO_WDT, despertares_wdt);
-			}
-			break;
+		if (cmd_baja > 1) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+		bt_enviar(RSP_DATO | DATO_ESTADO, estadoin);
+		if (cmd_baja == 1)
+		{
+			bt_enviar(RSP_DATO | DATO_ADC, leer_pot() >> 2);
+			bt_enviar(RSP_DATO | DATO_TEMP, valor_dh11);
+			bt_enviar(RSP_DATO | DATO_PRR, PRR);
+			bt_enviar(RSP_DATO | DATO_WDT, despertares_wdt);
+		}
+		break;
 
 		case (5):   // cambiar de estado (0..4 como en el diagrama)
-			if (cmd_baja > 4) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
-			if (seguro) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
-			bt_enviar(RSP_ACK | cmd_alta, cmd_baja);
-			if (cmd_baja == 4) registrar(EV_EMERGENCIA, 1);
-			cambiar_estado(tabla_bt[cmd_baja]);
-			break;
+		if (cmd_baja > 4) { bt_enviar(RSP_NACK | ERR_DATO, reg_cmd); return; }
+		if (seguro) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
+		bt_enviar(RSP_ACK | cmd_alta, cmd_baja);
+		if (cmd_baja == 4) registrar(EV_EMERGENCIA, 1);
+		cambiar_estado(tabla_bt[cmd_baja]);
+		break;
 
 		case (7):   // emergencia
-			if (cmd_baja == 1)
-			{
-				bt_enviar(RSP_ACK | cmd_alta, estadoin);
-				if (!seguro) { registrar(EV_EMERGENCIA, 1); cambiar_estado(emergencia); }
-			}
-			else
-			{
-				bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd);   // solo se sale con los botones
-			}
-			break;
+		if (cmd_baja == 1)
+		{
+			bt_enviar(RSP_ACK | cmd_alta, estadoin);
+			if (!seguro) { registrar(EV_EMERGENCIA, 1); cambiar_estado(emergencia); }
+		}
+		else
+		{
+			bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd);   // solo se sale con los botones
+		}
+		break;
 
 		default:
-			errores_chk++;
-			bt_enviar(RSP_NACK | ERR_COMANDO, reg_cmd);
-			break;
+		errores_chk++;
+		bt_enviar(RSP_NACK | ERR_COMANDO, reg_cmd);
+		break;
 	}
 }
 
