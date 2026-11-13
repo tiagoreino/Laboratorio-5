@@ -103,6 +103,9 @@ volatile uint8_t por_nivel = 0;
 
 static uint8_t ticks_100ms = 0;
 
+#define T_BUZZER_BT 1000          // ms que suena el buzzer cuando la actividad viene del celular
+static uint8_t actividad_bt = 0;
+
 // Banderas que maneja la app
 uint8_t led_on = 1, adc_on = 1, dht_on = 1, lcd_on = 1, eventos_on = 1;
 
@@ -256,13 +259,22 @@ static void dormir(uint8_t modo)
 	sei();
 }
 
+static void wdt_modo_b(void)
+{
+	ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+	{
+		wdt_reset();
+		WDTCSR = (1 << WDCE) | (1 << WDE);
+		WDTCSR = (1 << WDIE) | (1 << WDE) | (1 << WDP2) | (1 << WDP1) | (1 << WDP0);   // 2 s: primero interrupcion, despues reset
+	}
+}
+
 static void simular_bloqueo(void)
 {
 	lcd_titulo("SIMULANDO", "BLOQUEO...");
-	marca_bloqueo = 0xB10C;	
 	while (1)
 	{
-		// No se llama a wdt_reset() -> el WDT resetea a los 2 s
+		// No se llama a ereset() -> el WDT resetea a los 2 s
 	}
 }
 
@@ -279,9 +291,9 @@ int main(void){
 
 	configurar_interrupciones();
 
-	if (modo_reset) wdt_enable(WDTO_2S);
+	if (modo_reset) wdt_modo_b();
 
-	reset_wdt = ((mcusr_copia & (1 << WDRF)) != 0) || (marca_bloqueo == 0xB10C);
+	reset_wdt = (marca_bloqueo == 0xB10C);
 	marca_bloqueo = 0;
 	registrar(EV_RESET, mcusr_copia);
 
@@ -348,6 +360,7 @@ int main(void){
 			if (estado != emergencia)
 			{
 				notificar(EV_BOTON, 0);
+				actividad_bt = 0;     // si se aprieta B1 manda el boton
 				cambiar_estado(actividad);
 			}
 		}
@@ -429,14 +442,14 @@ static void apagado(void)
 		despertares_wdt++;
 		PORTD |= (1 << LED);              // pulso para medir el periodo
 		valor_adc = leer_pot();
-		_delay_ms(5);
+		_delay_ms(25);
 		PORTD &= ~(1 << LED);
 	}
 
 	botones_nivel();
 	if (modo_reset) wdt_disable();        // si no, el WDT resetea durante el sueño
 	dormir(SLEEP_MODE_PWR_DOWN);
-	if (modo_reset) wdt_enable(WDTO_2S);
+	if (modo_reset) wdt_modo_b();
 	botones_flanco();
 }
 
@@ -448,6 +461,19 @@ static void actividad(void)
 	{
 		entrar(EST_ACTIVO);
 		t_presionado = obtener_tiempo();
+	}
+	
+	if (actividad_bt)
+	{
+		PORTD |= (1 << Bu);
+		if (obtener_tiempo() - t_presionado >= T_BUZZER_BT)
+		{
+			actividad_bt = 0;
+			PORTD &= ~(1 << Bu);
+			marcar_actividad();
+			cambiar_estado(activo);
+		}
+		return;
 	}
 
 	if (!(PIND & (1 << B1)))
@@ -566,6 +592,7 @@ void ejecutar(uint8_t reg_cmd){
 		if (seguro) { bt_enviar(RSP_NACK | ERR_RECHAZADO, reg_cmd); return; }
 		bt_enviar(RSP_ACK | cmd_alta, cmd_baja);
 		if (cmd_baja == 4) registrar(EV_EMERGENCIA, 1);
+		if (cmd_baja == 3) actividad_bt = 1;
 		cambiar_estado(tabla_bt[cmd_baja]);
 		break;
 
@@ -717,5 +744,6 @@ ISR(INT1_vect)
 
 ISR(WDT_vect)
 {
-	evento_wdt = 1;
+	if (modo_reset) marca_bloqueo = 0xB10C;   // se vencio nuestro WDT: en el proximo vencimiento resetea
+	else evento_wdt = 1;
 }
